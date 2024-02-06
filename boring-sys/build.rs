@@ -1,3 +1,6 @@
+#[cfg(feature = "old_bindgen")]
+use old_bindgen as bindgen;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -134,6 +137,7 @@ fn get_boringssl_platform_output_path() -> String {
 const BORING_SSL_PATH: &str = "deps/boringssl-fips";
 #[cfg(not(feature = "fips"))]
 const BORING_SSL_PATH: &str = "deps/boringssl";
+const PATCHES_PATH: &str = "patches";
 
 /// Returns a new cmake::Config for building BoringSSL.
 ///
@@ -304,6 +308,80 @@ fn get_extra_clang_args_for_bindgen() -> Vec<String> {
     params
 }
 
+fn apply_patches() {
+    let patches = std::fs::read_dir(PATCHES_PATH).expect("failed to read patches directory");
+    for patch in patches {
+        if let Ok(patch_entry) = patch {
+            if let Some(ext) = patch_entry.path().extension() {
+                if ext == "patch" {
+                    let patch_abs_path =
+                        if let Ok(canonical_path) = std::fs::canonicalize(&patch_entry.path()) {
+                            canonical_path
+                        } else {
+                            panic!(
+                                "Failed to get canonical path for patch {:?}",
+                                patch_entry.path()
+                            );
+                        };
+
+                    // Check if the patch has already been applied by looking for a marker file or checking a condition
+                    let marker_file = Path::new(&BORING_SSL_PATH).join(format!(
+                        "{}.applied",
+                        patch_entry.file_name().to_string_lossy()
+                    ));
+                    if marker_file.exists() {
+                        println!(
+                            "Patch {:?} has already been applied. Skipping...",
+                            patch_entry.path()
+                        );
+                        continue;
+                    }
+
+                    // Apply the patch
+                    let status = Command::new("git")
+                        .args(&["apply", &adjust_canonicalization(&patch_abs_path)])
+                        .current_dir(BORING_SSL_PATH)
+                        .status();
+
+                    if let Ok(status) = status {
+                        if status.success() {
+                            // If the patch applied successfully, create a marker file to indicate it has been applied
+                            let _ = std::fs::write(marker_file, ""); // You can put any content or create an empty file
+                        } else {
+                            panic!("Failed to apply patch {:?}", patch_entry.path());
+                        }
+                    } else {
+                        panic!(
+                            "Failed to execute patch command for {:?}",
+                            patch_entry.path()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
+    // On non-Windows platforms, canonicalization is done by `git apply` and `git apply` expects
+    #[cfg(not(target_os = "windows"))]
+    {
+        p.as_ref().display().to_string()
+    }
+
+    // On Windows, canonicalization is done by `git apply` and `git apply` expects
+    #[cfg(target_os = "windows")]
+    {
+        const VERBATIM_PREFIX: &str = r#"\\?\"#;
+        let p = p.as_ref().display().to_string();
+        if p.starts_with(VERBATIM_PREFIX) {
+            p[VERBATIM_PREFIX.len()..].to_string()
+        } else {
+            p
+        }
+    }
+}
+
 fn main() {
     use std::env;
 
@@ -325,6 +403,9 @@ fn main() {
                 panic!("failed to fetch submodule - consider running `git submodule update --init --recursive deps/boringssl` yourself");
             }
         }
+
+        // apply patches
+        apply_patches();
 
         let mut cfg = get_boringssl_cmake_config();
 
@@ -384,16 +465,32 @@ fn main() {
         .derive_debug(true)
         .derive_default(true)
         .derive_eq(true)
-        .default_enum_style(bindgen::EnumVariation::NewType { is_bitfield: false })
         .default_macro_constant_type(bindgen::MacroTypeVariation::Signed)
         .generate_comments(true)
         .fit_macro_constants(false)
         .size_t_is_usize(true)
         .layout_tests(true)
         .prepend_enum_name(true)
-        .rustfmt_bindings(true)
         .clang_args(get_extra_clang_args_for_bindgen())
         .clang_args(&["-I", &include_path]);
+
+    #[cfg(feature = "old_bindgen")]
+    {
+        builder = builder
+            .default_enum_style(bindgen::EnumVariation::NewType { is_bitfield: false })
+            .rustfmt_bindings(true);
+    }
+
+    #[cfg(not(feature = "old_bindgen"))]
+    {
+        builder = builder
+            .default_enum_style(bindgen::EnumVariation::NewType {
+                is_bitfield: false,
+                is_global: false,
+            })
+            // Not supported by bindgen on all targets, not used by BoringSSL
+            .blocklist_type("max_align_t");
+    }
 
     let target = std::env::var("TARGET").unwrap();
     match target.as_ref() {
